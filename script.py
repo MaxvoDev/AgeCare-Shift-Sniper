@@ -21,6 +21,8 @@ previous_shift_list = []
 distance_list = {}
 lock  = threading.Lock()
 
+def chunk_list(lst, chunk_size):
+    return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
 
 def sendTelegram(msg_body):
     global botToken, chatId
@@ -78,8 +80,36 @@ def calculate_distance(home_address, target_suburb):
         return None
 
 
+def insert_textbox(str):
+    log_text.insert("1.0", str)
+
+def create_shift_tgmessage():
+    return f"""
+❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
+❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
+❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
+❤️❤️❤️ UPDATE LASTEST SHIFT EVERY 1 MINUTES
+❤️❤️❤️ ONLY SHIFT LESS THAN 60 KM ❤️❤️❤️❤️
+❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
+❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
+"""
+
+def create_shiftmessage(shift):
+    return f"""
+NAME: {shift["name"].upper()}
+SHIFT DATE: {shift["shift date"]}
+TOTAL HOURS: {shift["total seconds"] / 3600} hours
+SHIFT TYPE: {shift["shift type"]}
+TIME: {shift["time"]}
+PLACE: {shift["place"].upper()}
+GOOGLE MAP: { "https://www.google.com/maps/dir/14+Caswell+Cct,+Mawson+Lakes+SA+5095/" + '+'.join(shift["place"].split())}
+LINK: {"https://altaira.thisplanet.com.au" + shift["link"]} \n\n 
+"""
+
+
 def process_page(session, page):
-    global shift_list, distance_list 
+    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime
+    global shift_list, distance_list, previous_shift_list
 
     response = session.get(f"https://altaira.thisplanet.com.au/nurse/shiftrequests?page={page}")
     soup = BeautifulSoup(response.text, "html.parser")
@@ -97,6 +127,7 @@ def process_page(session, page):
         duration_seconds = (end_datetime - start_datetime).total_seconds()
 
         shift_time = start_time + " - " + end_time
+        shift_type = table_data[4].text.strip()
         target_location = table_data[-3].text.strip() + ", South Australia"
         target_location = target_location.lower()
         href = table_data[-1].select("a")[0]["href"]
@@ -111,17 +142,36 @@ def process_page(session, page):
         if not distance:
             distance = 1
 
-        with lock:
-            shift_list.append({
-                "name": target_name,
-                "shift date": shift_date,
-                "end time": datetime.strptime(end_time, "%H:%M"),
-                "total seconds": duration_seconds,
-                "time": shift_time,
-                "place": target_location,
-                "distance": distance,
-                "link": href
-            })
+        shift = {
+            "name": target_name,
+            "shift date": shift_date,
+            "start time": datetime.strptime(start_time, "%H:%M"),
+            "end time": datetime.strptime(end_time, "%H:%M"),
+            "total seconds": duration_seconds,
+            "shift type": shift_type,
+            "time": shift_time,
+            "place": target_location,
+            "distance": distance,
+            "link": href
+        }
+        
+        if is_snipingshift:
+            with lock:
+                day_index = is_good_snipe(shift)
+                if day_index > -1:
+                    snipe_it(session, shift)
+                    if is_succeed:
+                        done_snipe[snipe_listday[day_index]] = True
+                        send_message(f"""
+    SNIPE SUCEEDED !!!
+    {create_shiftmessage(shift)}
+                        """)
+
+        is_good = is_goodshift(shift)
+        if is_good:
+            with lock:
+                shift_list.append(shift)
+                previous_shift_list.append(shift["link"])
 
 def snipe_it(session, shift):
     pattern = r"id=(\d+)&addtoroster=true"
@@ -138,31 +188,72 @@ def snipe_it(session, shift):
         return True
     return False
 
+def login(session, account):
+    response = session.post('https://altaira.thisplanet.com.au/', account)
+    if response.status_code == 200:
+        return True
+    return False 
+
+def get_pagedata(session):
+    data = {
+        "start_date": "27/02/2024",
+        "end_date": "01/12/2024",
+        "AnyTime": "true",
+        "AnyTime": "false",
+        "hospitalId": "0",
+        "nurseTypeId": "0",
+        "shiftTypeId": "0",
+
+        "department": "All Departments"
+    }
+    response = session.post("https://altaira.thisplanet.com.au/nurse/shiftrequests?page=1", data)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, "html.parser")
+        paginations = soup.select("div.pager > a")
+        total_page = int(paginations[-1]["href"].split("?page=")[1])
+        return total_page
+
+    return -1
+
+def is_good_snipe(item):
+    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime
+    day_index = next((i for i, day in enumerate(snipe_listday) if day in item["shift date"]), -1)
+
+    if (day_index > -1 and not done_snipe.get(snipe_listday[day_index]) 
+    and item["total seconds"] > minshift_seconds and item["distance"] < snipe_maxdistance
+    and ( item["shift type"].upper() == "MORNING" or item["shift type"].upper() == "AFTERNOON" ) ):
+        return day_index 
+    return -1
+
+def is_goodshift(item):
+    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime, previous_shift_list
+
+    special_day = ["SAT", "SUN"]
+
+    is_special = any(day in item["shift date"].upper() for day in special_day)
+    if (is_special or item["distance"] < max_distance) and item["link"] not in previous_shift_list:
+        return True 
+    return False
+
+def send_message(str):
+    insert_textbox(str)
+    sendTelegram(str)
+
+def update_config(file_path, new_config):
+    with open(file_path, "w") as json_file:
+        json.dump(new_config, json_file, indent=4)
+
 def refreshData():
     global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime
 
-    data = config["account"]
-
+    unique_shift = []
+    shift_list = []
     session = requests.Session()
-    response = session.post('https://altaira.thisplanet.com.au/', data)
-    if response.status_code == 200:
 
-        data = {
-            "start_date": "27/02/2024",
-            "end_date": "01/12/2024",
-            "AnyTime": "true",
-            "AnyTime": "false",
-            "hospitalId": "0",
-            "nurseTypeId": "0",
-            "shiftTypeId": "0",
-            "department": "All Departments"
-        }
-        response = session.post("https://altaira.thisplanet.com.au/nurse/shiftrequests?page=1", data)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            paginations = soup.select("div.pager > a")
-            total_page = int(paginations[-1]["href"].split("?page=")[1])
-
+    is_succeed = login(session, config["account"])
+    if is_succeed:
+        total_page = get_pagedata(session)
+        if total_page > -1:
             threads = []
             for page in range(min(6, total_page)):
                 thread = threading.Thread(target=process_page, args=(session, page))
@@ -172,94 +263,24 @@ def refreshData():
             for thread in threads:
                 thread.join()
 
-            unique_shift = []
-            links = previous_shift_list
-            for item in shift_list:
-                special_day = ["SAT", "SUN"]
-
-                if is_snipingshift:
-                    day_index = next((i for i, day in enumerate(snipe_listday) if day in item["shift date"]), -1)
-
-                    if (day_index > -1 and not done_snipe.get(snipe_listday[day_index]) 
-                    and item["total seconds"] > minshift_seconds and item["distance"] < snipe_maxdistance
-                    and item["end time"] < max_endtime):
-                        done_snipe[snipe_listday[day_index]] = True
-
-                        is_succeed = snipe_it(session, item)
-
-                        if is_succeed:
-                            log_text.insert("1.0", f"""
-SNIPE SUCCEED !!!!
-NAME: {item["name"].upper()}
-SHIFT DATE: {item["shift date"]}
-TOTAL HOURS: {item["total seconds"] / 3600} hours
-TIME: {item["time"]}
-PLACE: {item["place"].upper()}
-GOOGLE MAP: { "https://www.google.com/maps/dir/14+Caswell+Cct,+Mawson+Lakes+SA+5095/" + '+'.join(item["place"].split())}
-LINK: {"https://altaira.thisplanet.com.au" + item["link"]} \n\n 
-                            """)
-
-                            sendTelegram(f"""
-SNIPE SUCCEED !!!!
-NAME: {item["name"].upper()}
-SHIFT DATE: {item["shift date"]}
-TOTAL HOURS: {item["total seconds"] / 3600} hours
-TIME: {item["time"]}
-PLACE: {item["place"].upper()}
-GOOGLE MAP: { "https://www.google.com/maps/dir/14+Caswell+Cct,+Mawson+Lakes+SA+5095/" + '+'.join(item["place"].split())}
-LINK: {"https://altaira.thisplanet.com.au" + item["link"]} \n\n 
-                            """)
-
-                is_special = any(day in item["shift date"].upper() for day in special_day)
-                if (is_special or item["distance"] < max_distance) and item["link"] not in links:
-                    links.append(item["link"])
-                    unique_shift.append(item)
-
-            log_text.insert("1.0", f"""
-Total Shift Got: {len(shift_list)}
-Total New Shift: {len(unique_shift)}            
+            insert_textbox(f"""
+TOTAL NEW SHIFT: {len(shift_list)}
             """)
-
-            sorted_shift_list = sorted(unique_shift, key=lambda x: x["distance"])
-
-            def chunk_list(lst, chunk_size):
-                return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
-
+            sorted_shift_list = sorted(shift_list, key=lambda x: x["distance"])
             chunked_list = chunk_list(sorted_shift_list, 10)
 
-            message = f"""
-❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
-❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
-❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
-❤️❤️❤️ UPDATE LASTEST SHIFT EVERY 1 MINUTES
-❤️❤️❤️ ONLY SHIFT LESS THAN 60 KM ❤️❤️❤️❤️
-❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
-❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️
-            """
+            message = create_shift_tgmessage()
             # Process each chunk
             for chunk in chunked_list:
                 for item in chunk:
-                    message += f"""
-NAME: {item["name"].upper()}
-SHIFT DATE: {item["shift date"]}
-TOTAL HOURS: {item["total seconds"] / 3600} hours
-TIME: {item["time"]}
-PLACE: {item["place"].upper()}
-GOOGLE MAP: { "https://www.google.com/maps/dir/14+Caswell+Cct,+Mawson+Lakes+SA+5095/" + '+'.join(item["place"].split())}
-LINK: {"https://altaira.thisplanet.com.au" + item["link"]} \n\n 
-                    """
+                    message += create_shiftmessage(item)
                 
-                sendTelegram(message)
+                send_message(message)
                 message = ""
 
-            with open(file_path, "w") as json_file:
-                json.dump(distance_list, json_file, indent=4)
-
-            with open(result_path, "w") as json_file:
-                json.dump(links, json_file, indent=4)
-
-            with open(config_path, "w") as json_file:
-                json.dump(config, json_file, indent=4)
+    update_config(file_path, distance_list)
+    update_config(result_path, previous_shift_list)
+    update_config(config_path, config)
 
 
 def snipe_shift():
@@ -286,8 +307,11 @@ def snipe_shift():
 
     random_coordinates = generate_random_coordinates(home_address, max_offset, num_coordinates)
 
+    log_text.insert("1.0", f"""
+PROGRAM RUNNING !!!          
+    """)
+
     while is_running:
-        shift_list = []
 
         log_text.insert("1.0", f"""
 Re-try Getting Newest Data - Running The Script Every {second} Seconds
@@ -297,7 +321,9 @@ Max Distance: {max_distance} Kilometers
         refreshData()
         time.sleep(second)
 
-    print("Program Ended !!!")
+    log_text.insert("1.0", f"""
+PROGRAM ENDED !!!          
+    """)
 
 def start():
     is_running = True 
@@ -306,6 +332,10 @@ def start():
 def stop():
     global is_running
     is_running = False
+
+    log_text.insert("1.0", f"""
+STOPPING PROGRAM !!!         
+    """)
 
 def init():
     global file_path, result_path, config_path
