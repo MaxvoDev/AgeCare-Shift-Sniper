@@ -1,0 +1,23 @@
+{
+    "botToken": "PUT YOUR TELEGRAM BOT TOKEN HERE",
+    "chatId": "PUT YOUR TELEGRAM GROUP ID HERE",
+    "account": {
+        "UserName": "PUT YOUR USERNAME HERE",
+        "Password": "PUT YOUR PASSWORD HERE"
+    },
+    "home_address": "PUT YOUR ADDRESS HERE",
+    "checking_interval": "30",
+    "maxdistance": "40",
+    "snipe_maxdistance": "20",
+    "max_distance_specialday": "40",
+    "minhours_shift": "8",
+    "exclude_area": "belair",
+    "snipe_list": "PUT THE DATE YOU WANT TO SNIPE Ex: 17 MAR(MORNING-AFTERNOON-NIGHT DUTY)|18 MAR(MORNING-AFTERNOON)",
+    "special_day": "SAT|SUN",
+    "is_sniping": "True",
+    "is_donesnipe": {},
+    "account_sid": "PUT YOUR TWILIO ACCOUNT TOKEN HERE",
+    "auth_token": "PUT YOUR TWILIO AUTH TOKEN HERE",
+    "my_number": "PUT YOUR TWILIO PHONE NUMBER HERE",
+    "temp_number": "PUT YOUR PHONE NUMBER TO RECEIVE MESSAGE HERE"
+}
