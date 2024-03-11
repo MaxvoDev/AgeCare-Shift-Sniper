@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 import requests
@@ -10,10 +10,13 @@ import time
 import tkinter as tk 
 from tkinter import ttk
 import re
+from twilio.rest import Client
 
 file_path = "distance.json"
 result_path = "shift.json"
 config_path = "config.json"
+random_coordinates_path = "random_coordinates.json"
+
 max_offset = 0.01
 num_coordinates = 20
 shift_list = []
@@ -23,6 +26,22 @@ lock  = threading.Lock()
 
 def chunk_list(lst, chunk_size):
     return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
+
+
+def calculate_duration(start_time, end_time):
+    start_datetime = datetime.strptime(start_time, "%H:%M")
+    end_datetime = datetime.strptime(end_time, "%H:%M")
+
+    # If end time is smaller than start time, it's likely that it's on the next day
+    if end_datetime < start_datetime:
+        end_datetime += timedelta(days=1)
+
+    duration_seconds = (end_datetime - start_datetime).total_seconds()
+    return duration_seconds
+
+
+def send_sms(str):
+    pass
 
 def sendTelegram(msg_body):
     global botToken, chatId
@@ -108,7 +127,7 @@ LINK: {"https://altaira.thisplanet.com.au" + shift["link"]} \n\n
 
 
 def process_page(session, page):
-    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime
+    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config
     global shift_list, distance_list, previous_shift_list
 
     response = session.get(f"https://altaira.thisplanet.com.au/nurse/shiftrequests?page={page}")
@@ -122,9 +141,7 @@ def process_page(session, page):
         
         start_time = table_data[2].text.strip()
         end_time =  table_data[3].text.strip()
-        start_datetime = datetime.strptime(start_time, "%H:%M")
-        end_datetime = datetime.strptime(end_time, "%H:%M")
-        duration_seconds = (end_datetime - start_datetime).total_seconds()
+        duration_seconds = calculate_duration(start_time, end_time)
 
         shift_time = start_time + " - " + end_time
         shift_type = table_data[4].text.strip()
@@ -154,21 +171,21 @@ def process_page(session, page):
             "distance": distance,
             "link": href
         }
-        
-        if is_snipingshift:
-            with lock:
-                day_index = is_good_snipe(shift)
-                if day_index > -1:
-                    snipe_it(session, shift)
-                    if is_succeed:
-                        done_snipe[snipe_listday[day_index]] = True
-                        send_message(f"""
-    SNIPE SUCEEDED !!!
-    {create_shiftmessage(shift)}
-                        """)
 
-        is_good = is_goodshift(shift)
-        if is_good:
+        return_type, day_index = is_goodshift(shift)
+        if return_type > -1:
+            if return_type == 1:
+                    with lock:
+                        if not done_snipe.get(snipe_listday[day_index]):
+                            is_succeed = snipe_it(session, shift)
+                            if is_succeed:
+                                done_snipe[snipe_listday[day_index]] = True
+
+                                send_message(f"""
+ALTARA - ĐĂNG KÍ THÀNH CÔNG SHIFT NÀY RỒI NÈ BÉ GIANG !!!
+{create_shiftmessage(shift)}
+                                """)
+
             with lock:
                 shift_list.append(shift)
                 previous_shift_list.append(shift["link"])
@@ -215,25 +232,47 @@ def get_pagedata(session):
 
     return -1
 
-def is_good_snipe(item):
-    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime
-    day_index = next((i for i, day in enumerate(snipe_listday) if day in item["shift date"]), -1)
-
-    if (day_index > -1 and not done_snipe.get(snipe_listday[day_index]) 
-    and item["total seconds"] > minshift_seconds and item["distance"] < snipe_maxdistance
-    and ( item["shift type"].upper() == "MORNING" or item["shift type"].upper() == "AFTERNOON" ) ):
-        return day_index 
-    return -1
-
 def is_goodshift(item):
-    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime, previous_shift_list
+    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, previous_shift_list, max_distance_specialday
+    global excludearea, snipe_day_shifttype
+    global special_day
 
-    special_day = ["SAT", "SUN"]
+    min_shift_specialday = 6 * 3600
 
+    is_in_excludeare = any(area.upper() in item["place"].upper() for area in excludearea)
     is_special = any(day in item["shift date"].upper() for day in special_day)
-    if (is_special or item["distance"] < max_distance) and item["link"] not in previous_shift_list:
-        return True 
-    return False
+    day_index = next((i for i, day in enumerate(snipe_listday) if day in item["shift date"].upper()), -1)
+
+    if (
+        # If this is on the list need to snipe or its a special holiday or SAT, SUN
+        (day_index > -1 or is_special) 
+        # Not Show on Telegram Before
+        and item["link"] not in previous_shift_list
+        # Need to be within a Distance
+        and item["distance"] < max_distance
+    ):
+        if (
+            day_index > -1
+            and not done_snipe.get(snipe_listday[day_index]) 
+            and 
+            (
+                (is_special and item["total seconds"] >= min_shift_specialday) 
+                or item["total seconds"] >= minshift_seconds
+            )
+        ): 
+            is_right_shift_to_pick = any(shift in item["shift type"].upper() for shift in snipe_day_shifttype[day_index] )
+            if (
+                is_right_shift_to_pick
+                and ((is_special and item["distance"] < max_distance_specialday) 
+                or (item["distance"] < snipe_maxdistance and not is_in_excludeare))
+            ):
+                #If this shift have all requirements, snipe it
+                return 1, day_index
+
+        # If this is a special day (SAT, SUN) or a shift on our snipe list but its not exactly like our requirement, show it on Telegram group
+        return 0, 0
+
+    return -1, -1
 
 def send_message(str):
     insert_textbox(str)
@@ -244,7 +283,8 @@ def update_config(file_path, new_config):
         json.dump(new_config, json_file, indent=4)
 
 def refreshData():
-    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config, max_endtime
+    global max_distance, log_text, shift_list, minshift_seconds, snipe_listday, is_snipingshift, done_snipe, snipe_maxdistance, config
+    global random_coordinates_path, random_coordinates
 
     unique_shift = []
     shift_list = []
@@ -281,18 +321,23 @@ TOTAL NEW SHIFT: {len(shift_list)}
     update_config(file_path, distance_list)
     update_config(result_path, previous_shift_list)
     update_config(config_path, config)
+    update_config(random_coordinates_path, random_coordinates)
 
 
 def snipe_shift():
     global is_running, config
-    global max_distance_entry, checking_interval_entry, bottoken_entry, home_address_entry, groupid_entry, log_text, snipe_maxdistance_entry
+    global max_distance_entry, checking_interval_entry, bottoken_entry, home_address_entry, groupid_entry, log_text, snipe_maxdistance_entry, max_distance_specialday_entry
     global botToken, chatId, home_address, max_distance
     global random_coordinates, max_offset, num_coordinates
-    global auto_snipe_var, minhours_shift_entry, snipe_list_entry, max_endtime_entry
+    global auto_snipe_var, minhours_shift_entry, snipe_list_entry
     global minshift_seconds, snipe_listday, is_snipingshift
-    global done_snipe, snipe_maxdistance, max_endtime
+    global done_snipe, snipe_maxdistance, max_distance_specialday
+    global excludearea_entry, excludearea, snipe_day_shifttype
+    global start_button, special_day_entry, special_day
+    global random_coordinates
 
-    max_endtime = datetime.strptime(max_endtime_entry.get(), "%H:%M")
+    excludearea = excludearea_entry.get().split("|")
+    max_distance_specialday = int(max_distance_specialday_entry.get())
     snipe_maxdistance = int(snipe_maxdistance_entry.get())
     done_snipe = config["is_donesnipe"]
     is_running = True  
@@ -301,45 +346,63 @@ def snipe_shift():
     home_address = home_address_entry.get()
     max_distance = int(max_distance_entry.get())
     second = int(checking_interval_entry.get())
-    minshift_seconds = int(minhours_shift_entry.get()) * 3600
-    snipe_listday = snipe_list_entry.get().split("|")
+    minshift_seconds = float(minhours_shift_entry.get()) * 3600
+
+    day_w_shift = snipe_list_entry.get()
+    
+    snipe_listday = re.findall(r"(\d+\s[A-Z]{3})", day_w_shift)
+    snipe_day_shifttype = re.findall(r"\(([A-Z\-\s]+)\)", day_w_shift)
+
     is_snipingshift = auto_snipe_var.get()
 
-    random_coordinates = generate_random_coordinates(home_address, max_offset, num_coordinates)
+    if not random_coordinates:
+        random_coordinates = generate_random_coordinates(home_address, max_offset, num_coordinates)
+
+    special_day = special_day_entry.get().split("|")
 
     log_text.insert("1.0", f"""
 PROGRAM RUNNING !!!          
     """)
 
     while is_running:
+        try:
+            log_text.insert("1.0", f"""
+    Re-try Getting Newest Data - Running The Script Every {second} Seconds
+    Max Distance: {max_distance} Kilometers            
+            """)
+            
+            refreshData()
+            time.sleep(second)
 
-        log_text.insert("1.0", f"""
-Re-try Getting Newest Data - Running The Script Every {second} Seconds
-Max Distance: {max_distance} Kilometers            
-        """)
-        
-        refreshData()
-        time.sleep(second)
+        except Exception as e:
+            continue
 
     log_text.insert("1.0", f"""
 PROGRAM ENDED !!!          
     """)
+    start_button.configure(text="START")
 
-def start():
-    is_running = True 
-    threading.Thread(target=snipe_shift).start()
+def handleButtonClick():
+    global start_button, is_running
+    current_text = start_button.cget("text")
 
-def stop():
-    global is_running
-    is_running = False
-
-    log_text.insert("1.0", f"""
-STOPPING PROGRAM !!!         
-    """)
+    if(current_text == "START"):
+        start_button.configure(text="STOP")
+        is_running = True 
+        threading.Thread(target=snipe_shift).start()
+    
+    else:
+        start_button.configure(text="STOPPING...")
+        is_running = False 
+        log_text.insert("1.0", f"""
+    STOPPING PROGRAM !!!         
+        """)
 
 def init():
     global file_path, result_path, config_path
-    global distance_list, previous_shift_list, config 
+    global distance_list, previous_shift_list, config, twilio_client
+    global my_number, temp_number
+    global random_coordinates_path, random_coordinates
 
     with open(file_path, "r") as json_file:
         distance_list = json.load(json_file)
@@ -350,15 +413,26 @@ def init():
     with open(config_path, "r") as json_file:
         config = json.load(json_file)
 
+    with open(random_coordinates_path, "r") as json_file:
+        random_coordinates = json.load(json_file)
+
+    account_sid = config["account_sid"]
+    auth_token = config["auth_token"]
+    twilio_client = Client(account_sid, auth_token)
+    my_number = config["my_number"]
+    temp_number = config["temp_number"]
+
 
 def draw():
     global bottoken_frame, bottoken_entry, groupid_frame, groupid_entry
-    global homeaddress_frame, home_address_entry, maxdistance_frame, max_distance_entry, snipe_maxdistance_entry, max_endtime_entry
+    global homeaddress_frame, home_address_entry, maxdistance_frame, max_distance_entry, snipe_maxdistance_entry, max_distance_specialday_entry
     global checking_interval_frame, checking_interval_entry, auto_snipe_frame
     global auto_snipe_var, auto_snipe_checkbox, snipe_list_frame, snipe_list_entry
     global minhours_shift_frame, minhours_shift_entry, start_button, stop_button
     global log_text
     global config
+    global excludearea_entry
+    global special_day_entry
 
     root = tk.Tk()
     root.title("Aged Care Shift Sniper !!!")
@@ -397,7 +471,7 @@ def draw():
     maxdistance_frame.grid(row=3, column=0)
 
     max_distance_entry = ttk.Entry(maxdistance_frame)
-    max_distance_entry.insert(0, "60")
+    max_distance_entry.insert(0, config["maxdistance"])
     max_distance_entry.grid(row=0, column=0, sticky="ew")
 
     checking_interval_frame = ttk.LabelFrame(frame, text="Checking Interval (in Seconds)")
@@ -414,42 +488,60 @@ def draw():
     auto_snipe_checkbox = ttk.Checkbutton(auto_snipe_frame, variable=auto_snipe_var)
     auto_snipe_checkbox.grid(row=0, column=0, sticky="ew")
 
-    snipe_list_frame = ttk.LabelFrame(frame, text="Date want to Snipe (Ex: 25|26)")
-    snipe_list_frame.grid(row=6, column=0)
-
-    snipe_list_entry = ttk.Entry(snipe_list_frame)
-    snipe_list_entry.insert(0, "25|26")
-    snipe_list_entry.grid(row=0, column=0, sticky="ew")
+    auto_snipe_var.set(bool(config["is_sniping"]))
 
     snipe_maxdistance_frame = ttk.LabelFrame(frame, text="Snipe Max Distance (in Kilometers)")
-    snipe_maxdistance_frame.grid(row=7, column=0)
+    snipe_maxdistance_frame.grid(row=6, column=0)
 
     snipe_maxdistance_entry = ttk.Entry(snipe_maxdistance_frame)
     snipe_maxdistance_entry.insert(0, config["snipe_maxdistance"])
     snipe_maxdistance_entry.grid(row=0, column=0, sticky="ew")
 
     minhours_shift_frame = ttk.LabelFrame(frame, text="Min Shift Snipe (in Hours)")
-    minhours_shift_frame.grid(row=8, column=0)
+    minhours_shift_frame.grid(row=7, column=0)
 
     minhours_shift_entry = ttk.Entry(minhours_shift_frame)
     minhours_shift_entry.insert(0, config["minhours_shift"])
     minhours_shift_entry.grid(row=0, column=0)
 
-    max_endtime_frame = ttk.LabelFrame(frame, text="Max End Time (in DateTime)")
-    max_endtime_frame.grid(row=9, column=0)
+    max_distance_specialday_frame = ttk.LabelFrame(frame, text="Max Distance for Special Day (in Kilometers)")
+    max_distance_specialday_frame.grid(row=8, column=0)
 
-    max_endtime_entry = ttk.Entry(max_endtime_frame)
-    max_endtime_entry.insert(0, config["max_endtime"])
-    max_endtime_entry.grid(row=0, column=0)
+    max_distance_specialday_entry = ttk.Entry(max_distance_specialday_frame)
+    max_distance_specialday_entry.insert(0, config["max_distance_specialday"])
+    max_distance_specialday_entry.grid(row=0, column=0)
 
-    start_button = ttk.Button(frame, text="Start", command=start)
+    excludearea_frame = ttk.LabelFrame(frame, text="Exclude These Area (Eg: Mawson Lakes)")
+    excludearea_frame.grid(row=9, column=0)
+
+    excludearea_entry = ttk.Entry(excludearea_frame)
+    excludearea_entry.insert(0, config["exclude_area"])
+    excludearea_entry.grid(row=0, column=0)
+
+    start_button = ttk.Button(frame, text="START", command=handleButtonClick)
     start_button.grid(row=10, column=0, sticky="ew")
 
-    stop_button = ttk.Button(frame, text="Stop", command=stop)
-    stop_button.grid(row=11, column=0, sticky="ew")
+    frame.columnconfigure(1, weight=1)
+
+    special_day_frame = ttk.LabelFrame(frame, text="Special Day (Ex: SAT|SUN)")
+    special_day_frame.grid(row=0, column=1, sticky="ew")
+    special_day_frame.columnconfigure(0, weight=1)
+
+    special_day_entry = ttk.Entry(special_day_frame)
+    special_day_entry.insert(0, config["special_day"])
+    special_day_entry.grid(row=0, column=0, sticky="ew")
+
+
+    snipe_list_frame = ttk.LabelFrame(frame, text="Date want to Snipe (Ex: 25|26)")
+    snipe_list_frame.grid(row=1, column=1, sticky="ew")
+    snipe_list_frame.columnconfigure(0, weight=1)
+
+    snipe_list_entry = ttk.Entry(snipe_list_frame)
+    snipe_list_entry.insert(0, config["snipe_list"])
+    snipe_list_entry.grid(row=0, column=0, sticky="ew")
 
     log_text = tk.Text(frame, height=10, width=80)
-    log_text.grid(row=0, column=1, rowspan=10, columnspan=100, sticky="nswe", padx=10, pady=10)
+    log_text.grid(row=2, column=1, rowspan=10, columnspan=100, sticky="nswe", padx=10, pady=10)
 
     root.mainloop()
 
