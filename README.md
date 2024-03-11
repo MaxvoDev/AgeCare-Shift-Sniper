@@ -16,7 +16,7 @@ This project aims to automate the process of sniping shifts for healthcare worke
 The program fetches shift data from a specified website, processes it to identify shifts that meet sniping criteria, and automatically snipes eligible shifts. It then sends notifications via Telegram to inform the user about the sniped shifts and any relevant updates.
 
 ## GUI
-
+![GUI](GUI.png "GUI")
 
 ## Usage
 
